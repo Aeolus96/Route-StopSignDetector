@@ -1,0 +1,19 @@
+<launch>
+    <!-- Start Dynamic Reconfigure GUI. First because slow startup process -->
+    <node pkg="rqt_reconfigure" type="rqt_reconfigure" name="rqt_console" args="-t" />
+
+    <!-- Start stop sign detection node. Runs python script -->
+    <node pkg="ltu_actor_route_stop_sign_detector" name="route_stop_sign_detector" type="detect.py" respawn="true" respawn_delay="10" output="screen">
+        
+        <!-- Yolov8 model ".pt" file path has to be from root namespace - python and ROS requirement -->
+        <param name="model_path_from_root" type="string" value="/models/best.pt" />
+        
+        <!-- Input Topic -->
+        <param name="imgtopic_name" type="string" value="/camera/image_raw" />
+        <!-- Output Topic -->
+        <param name="stop_sign_detected_topic_name" type="string" value="stop_sign_detected" />
+        <param name="stop_sign_size_topic_name" type="string" value="stop_sign_size" />
+
+    </node>
+
+</launch>
