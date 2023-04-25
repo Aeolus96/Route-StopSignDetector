@@ -6,13 +6,15 @@
     <node pkg="ltu_actor_route_stop_sign_detector" name="route_stop_sign_detector" type="detect.py" respawn="true" respawn_delay="10" output="screen">
         
         <!-- Yolov8 model ".pt" file path has to be from root namespace - python and ROS requirement -->
-        <param name="model_path_from_root" type="string" value="/models/best.pt" />
+        <param name="model_coco_path_from_root" type="string" value="/home/dev/actor_ws/src/Route-StopSignDetector/models/yolov8m.pt" />
+        <param name="model_stop_path_from_root" type="string" value="/home/dev/actor_ws/src/Route-StopSignDetector/models/best.pt" />
         
         <!-- Input Topic -->
         <param name="imgtopic_name" type="string" value="/camera/image_raw" />
+        <!-- <param name="imgtopic_name" type="string" value="/cam_pub/image_raw" /> -->
         <!-- Output Topic -->
-        <param name="stop_sign_detected_topic_name" type="string" value="stop_sign_detected" />
-        <param name="stop_sign_size_topic_name" type="string" value="stop_sign_size" />
+        <param name="stop_sign_detected_topic_name" type="string" value="/stop_sign_detected" />
+        <param name="stop_sign_size_topic_name" type="string" value="/stop_sign_size" />
 
     </node>
 

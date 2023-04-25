@@ -12,13 +12,16 @@ from ltu_actor_route_stop_sign_detector.cfg import StopSignDetectConfig  # packa
 
 ########################################################################
 ### Global Variables:
-global enabled  # On/Off for the entire code. If no subscribers are available, no need to run this node
-enabled = False
 global config_  # Dynamic reconfiguration holder
 global bridge  # ROS-CV bridge
 bridge = CvBridge()
-global model_path  # Get yolov8 model's path
-global model  # YOLOv8 model loaded globally
+global model_stop_path  # Get yolov8 stop sign model's path
+global model_coco_path  # Get yolov8 default model's path
+global model_stop  # Model to distinguish between stop sign categories
+global model_coco  # Model to find stop sign bounding boxes
+global resize_size
+resize_size = 640  # pixel resolution for input data
+global image_size
 
 ########################################################################
 ### Functions:
@@ -33,20 +36,31 @@ def dyn_rcfg_cb(config, level):
 
 # Image callback - Converts ROS Image to OpenCV Image and feeds it to the YOLO layer
 def get_image(Image):
-    if enabled:
+    if config_.enable:
         global bridge
         try:  # convert ros_image into an opencv-compatible image
-            cv_image = bridge.imgmsg_to_cv2(Image, "rgb8")
+            cv_image = bridge.imgmsg_to_cv2(Image, "bgr8")
         except CvBridgeError as e:
             print(e)
         # Now cv_image is a standard OpenCV matrice
-        find_stop_sign(resize_image(cv_image))
+
+        global image_size  # find the pixel resolution [h x w]
+        height = cv_image.shape[0]
+        width = cv_image.shape[1]
+        image_size = height * width
+
+        cv_image = cv2.flip(cv_image, 0)  # Upside down
+        cv_image = cv2.flip(cv_image, 1)  # Side to side
+
+        publish_results(find_stop_sign(cv_image))
+    else:
+        cv2.destroyAllWindows()  # Close all windows
     return
 
 
 # Resize cv_image to desired size with black letterbox
 # from: https://stackoverflow.com/questions/44650888/resize-an-image-without-distortion-opencv
-def resize_image(img, size=(640, 640)):
+def resize_image(img, size=(resize_size, resize_size)):
     h, w = img.shape[:2]
     c = img.shape[2] if len(img.shape) > 2 else 1
     if h == w:
@@ -66,56 +80,95 @@ def resize_image(img, size=(640, 640)):
 
 # Use YOLOv8 to predict stop signs
 def find_stop_sign(cv_image):
-    show_image = config_.debug # Get bool from ROS dynrcfg
-    
-    results = model.predict( # Run YOLOv8 prediction with
+    # >>> STAGE 1: Detection
+    # Use default YOLOv8m model trained on the COCO dataset to find bounding box of the stop sign
+    coco_results = model_coco(
         source=cv_image,  # Image source
-        imgsz=640,  # Image size (square)
-        conf=0.7,  # Confidence threshold
-        iou=0.75,  # Overlap threshold
-        show=show_image,  # Show the results <<<<<<<<TEST
-        device="0",  # CUDA device
+        classes=11,  # only detect class name "stop sign" from COCO dataset
+        device="0",  # Use GPU for inference
+    )
+    # Use YOLOv8m model trained on the StopSignDetection (with fake signs) dataset to find bounding box of the stop sign
+    stop_results = model_stop(
+        source=cv_image,  # Input image
+        # imgsz=detection_size,  # Input resolution
+        agnostic_nms=True,  # Prevents overlapping classes (selects highest confidence)
+        device="0",  # Use GPU
     )
 
-    # Use results to determine class and size
-    # results.boxes (Properties):
-    # boxes.xyxy  # box with xyxy format, (N, 4)
-    # boxes.xywh  # box with xywh format, (N, 4)
-    # boxes.xyxyn  # box with xyxy format but normalized, (N, 4)
-    # boxes.xywhn  # box with xywh format but normalized, (N, 4)
-    # boxes.conf  # confidence score, (N, 1)
-    # boxes.cls  # cls, (N, 1)
-    # boxes.data  # raw bboxes tensor, (N, 6) or boxes.boxes
+    # Show the detected images real-time for debug
+    if config_.debug:
+        coco_results_img = resize_image(coco_results[0].plot())
+        stop_results_img = resize_image(stop_results[0].plot())
+        vertically_stacked_img = np.concatenate((coco_results_img, stop_results_img), axis=0)
+        cv2.imshow("YOLO-COCO Detections", vertically_stacked_img)
+        cv2.waitKey(1)
 
-    # Get the bounding boxes and class labels for all detected objects
-    boxes = results.xyxy[0].numpy()  # Data cast to numpy format
-    labels = results.names # Direct class labels access
+    # Used to pass results to the next function:
+    at_least_one_stop_sign = False  # Not confirmed yet
+    biggest_bounding_box = 0  # Only get bounding box after confirmation
 
-    # Iterate over all detected objects
-    for box in boxes:
-        print(box)
-        # Get the class label for this object
-        label = labels[int(box[5])]
+    # >>> STAGE 2: Analyze results
+    coco_boxes = coco_results[0].boxes.cpu().numpy()  # Only cast boxes to numpy
+    coco_labels = coco_results[0].names  # Direct class labels access
+    coco_detected = False
+    # {11: "stop sign"}
+    stop_boxes = stop_results[0].boxes.cpu().numpy()  # Only cast boxes to numpy
+    stop_labels = stop_results[0].names  # Direct class labels access
+    stop_detected = False
+    fake_detected = False
+    # {0: 'stop-sign', 1: 'stop-sign-fake', 2: 'stop-sign-obstructed', 3: 'stop-sign-vandalized'}
 
-        # Check if this object is a stop sign
-        if label == "stop-sign":
-            # Get the bounding box coordinates for this stop sign
-            x1, y1, x2, y2 = box[:4]
+    for coco_idx, coco_box in enumerate(coco_boxes):  # Iterate coco bounding boxes and find the largest one
+        coco_label = coco_labels[int(coco_box.cls)]  # Get the class label
+        if coco_label == "stop sign":  # Check if this object is an actual stop sign
+            coco_detected = True
+            # Find the width and height of the bounding box
+            box_width = coco_box.xywh[0][2]
+            box_height = coco_box.xywh[0][3]
+            area = 100 * ((box_width * box_height) / image_size)  # Percent Area
+            if area > biggest_bounding_box:  # Store the largest bounding box
+                biggest_bounding_box = area
 
-            # Calculate the width and height of the bounding box
-            width = x2 - x1
-            height = y2 - y1
+    for stop_idx, stop_box in enumerate(stop_boxes):  # Iterate stop bounding boxes and find the largest one
+        stop_label = stop_labels[int(stop_box.cls)]  # Get the class label
+        if stop_label == "stop-sign" or stop_label == "stop-sign-obstructed" or stop_label == "stop-sign-vandalized":
+            stop_detected = True
+            # Find the width and height of the bounding box
+            box_width = stop_box.xywh[0][2]
+            box_height = stop_box.xywh[0][3]
+            area = 100 * ((box_width * box_height) / image_size)  # Percent Area
+            if area > biggest_bounding_box:  # Store the largest bounding box
+                biggest_bounding_box = area
+        if stop_label == "stop-sign-fake":
+            fake_detected = True
 
-            # Print the location and size of the stop sign
-            print(f"Stop sign detected at ({x1:.1f}, {y1:.1f}) with size ({width:.1f}, {height:.1f})")
+    # >>> STAGE 3: Determine the logic
+    # Temporary logic for determining stop signs
+    # Could be wrong if two signs are detected at the same time, one fake and another legitimate
+    if not fake_detected:  # No fake stop signs
+        if coco_detected or stop_detected:  # Either model detected a valid stop sign
+            at_least_one_stop_sign = True
 
+    return at_least_one_stop_sign, int(biggest_bounding_box * 100)  # bool, int (Percent * 100, 89% = 8900)
+
+
+# Simple ROS message publisher
+def publish_results(results):
+    (detected, area) = results
+    sign_msg = UInt8()  # Bool 0==False, !0==True
+    sign_msg.data = detected
+    sign_detect_pub.publish(sign_msg)
+
+    size_msg = UInt32()  # Detection box area (Percent Area * 100)
+    size_msg.data = area
+    sign_size_pub.publish(size_msg)
     return
 
 
-# Find if anyone is subscribed to this node
-def has_subscribers():
-    # False if 0 connections for both - no need to run node
-    return (sign_detect_pub.get_num_connections()) or (sign_size_pub.get_num_connections())
+# # Find if anyone is subscribed to this node
+# def has_subscribers():
+#     # False if 0 connections for both - no need to run node
+#     return (sign_detect_pub.get_num_connections()) or (sign_size_pub.get_num_connections())
 
 
 ########################################################################
@@ -123,6 +176,12 @@ def has_subscribers():
 if __name__ == "__main__":
     # Node name
     rospy.init_node("route_stop_sign_detector", anonymous=False)
+
+    # Load the YOLO model at startup
+    model_stop_path = rospy.get_param("~model_stop_path_from_root")  # Load latest path
+    model_stop = YOLO(model_stop_path)
+    model_coco_path = rospy.get_param("~model_coco_path_from_root")  # Load latest path
+    model_coco = YOLO(model_coco_path)
 
     # Dynamic Reconfigure parameter server
     srv = Server(StopSignDetectConfig, dyn_rcfg_cb)  # Using common cfg file for entire project
@@ -135,21 +194,11 @@ if __name__ == "__main__":
     sign_detect_topic = rospy.get_param("~stop_sign_detected_topic_name")
     sign_size_topic = rospy.get_param("~stop_sign_size_topic_name")
     sign_detect_pub = rospy.Publisher(sign_detect_topic, UInt8, queue_size=10)  # Bigger queue size???
-    sign_msg = UInt8()  # Bool 0==False, !0==True
-    sign_size_pub = rospy.Publisher(sign_detect_topic, UInt32, queue_size=10)  # to check for false positives???
-    size_msg = UInt32()  # Detection box area (h x w in pixels)
+    sign_size_pub = rospy.Publisher(sign_size_topic, UInt32, queue_size=10)  # to check for false positives???
 
     # Start Looping
     try:
         while not rospy.is_shutdown():
-            if has_subscribers():  # At least one subscriber connected
-                if not enabled:  # Startup if not enabled
-                    model_path = rospy.get_param("~model_path_from_root")  # Load latest path
-                    model = YOLO(model_path)  # Reload model (allows changing model while running)
-                    enabled = True
-            else:  # No subscribers connected
-                if enabled:
-                    enabled = False  # Shutdown
             rospy.spin()  # Runs callbacks
     except rospy.ROSInterruptException:
         cv2.destroyAllWindows()  # Close all windows
