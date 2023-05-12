@@ -19,8 +19,8 @@ global model_stop_path  # Get yolov8 stop sign model's path
 global model_coco_path  # Get yolov8 default model's path
 global model_stop  # Model to distinguish between stop sign categories
 global model_coco  # Model to find stop sign bounding boxes
-global resize_size
-resize_size = 640  # pixel resolution for input data
+global display_size
+display_size = 640  # pixel resolution for input data
 global image_size
 
 ########################################################################
@@ -34,7 +34,7 @@ def dyn_rcfg_cb(config, level):
     return config
 
 
-# Image callback - Converts ROS Image to OpenCV Image and feeds it to the YOLO layer
+# Image callback - Converts ROS Image to OpenCV Image and feeds it to the YOLO layer to then publish stop sign detection results to ROS topics
 def get_image(Image):
     if config_.enable:
         global bridge
@@ -44,23 +44,28 @@ def get_image(Image):
             print(e)
         # Now cv_image is a standard OpenCV matrice
 
+        # Resize according to dynamic reconfigure settings
+        cv_image = resize_image(cv_image, size=(config_.image_resize, config_.image_resize))
+
         global image_size  # find the pixel resolution [h x w]
         height = cv_image.shape[0]
         width = cv_image.shape[1]
         image_size = height * width
 
-        cv_image = cv2.flip(cv_image, 0)  # Upside down
-        cv_image = cv2.flip(cv_image, 1)  # Side to side
+        if config_.flip_image:  # flip the image if camera is mounted upside-down
+            cv_image = cv2.flip(cv_image, 0)  # Upside down
+            cv_image = cv2.flip(cv_image, 1)  # Side to side
 
         publish_results(find_stop_sign(cv_image))
+
     else:
-        cv2.destroyAllWindows()  # Close all windows
+        cv2.destroyAllWindows()  # Close all OpenCV display windows if this node is disabled temporarily
     return
 
 
 # Resize cv_image to desired size with black letterbox
 # from: https://stackoverflow.com/questions/44650888/resize-an-image-without-distortion-opencv
-def resize_image(img, size=(resize_size, resize_size)):
+def resize_image(img, size=(display_size, display_size)):
     h, w = img.shape[:2]
     c = img.shape[2] if len(img.shape) > 2 else 1
     if h == w:
@@ -80,7 +85,10 @@ def resize_image(img, size=(resize_size, resize_size)):
 
 # Use YOLOv8 to predict stop signs
 def find_stop_sign(cv_image):
-    # >>> STAGE 1: Detection
+    # >>> STAGE 1: Detection using two models (COCO dataset model is really good for stop signs in good lighting
+    # conditions without obstructions or vandalism. The second custom trained model is for stop signs that are
+    # not in the best of conditions or to detect fake stop signs)
+
     # Use default YOLOv8m model trained on the COCO dataset to find bounding box of the stop sign
     coco_results = model_coco(
         source=cv_image,  # Image source
@@ -90,8 +98,7 @@ def find_stop_sign(cv_image):
     # Use YOLOv8m model trained on the StopSignDetection (with fake signs) dataset to find bounding box of the stop sign
     stop_results = model_stop(
         source=cv_image,  # Input image
-        # imgsz=detection_size,  # Input resolution
-        agnostic_nms=True,  # Prevents overlapping classes (selects highest confidence)
+        agnostic_nms=True,  # Prevents overlapping classes (selects class with highest confidence)
         device="0",  # Use GPU
     )
 
@@ -103,11 +110,12 @@ def find_stop_sign(cv_image):
         cv2.imshow("YOLO-COCO Detections", vertically_stacked_img)
         cv2.waitKey(1)
 
+    # >>> STAGE 2: Analyze results
+
     # Used to pass results to the next function:
     at_least_one_stop_sign = False  # Not confirmed yet
-    biggest_bounding_box = 0  # Only get bounding box after confirmation
+    biggest_bounding_box = 0.0  # Only get bounding box after confirmation
 
-    # >>> STAGE 2: Analyze results
     coco_boxes = coco_results[0].boxes.cpu().numpy()  # Only cast boxes to numpy
     coco_labels = coco_results[0].names  # Direct class labels access
     coco_detected = False
@@ -143,13 +151,17 @@ def find_stop_sign(cv_image):
             fake_detected = True
 
     # >>> STAGE 3: Determine the logic
-    # Temporary logic for determining stop signs
-    # Could be wrong if two signs are detected at the same time, one fake and another legitimate
+    # Temporary logic for determining stop signs with two models
+    # Will be incorrect if two actual signs are detected at the same time, one fake and another legitimate
+    # ***Bug ignored for now as IGVC does not specify a condition like that***
     if not fake_detected:  # No fake stop signs
         if coco_detected or stop_detected:  # Either model detected a valid stop sign
-            at_least_one_stop_sign = True
+            # Added a condition to sanity check if biggest bounding box is under a threshold value
+            # Eg: 70% of image. If the sign is that close to the camera, the car has already crashed into the sign.
+            if biggest_bounding_box < config_.box_limit:  # helps eliminate false positives for vandalized signs
+                at_least_one_stop_sign = True
 
-    return at_least_one_stop_sign, int(biggest_bounding_box * 100)  # bool, int (Percent * 100, 89% = 8900)
+    return at_least_one_stop_sign, int(biggest_bounding_box * 100)  # bool, int (Percent * 100, 43% = 4300)
 
 
 # Simple ROS message publisher
@@ -163,13 +175,6 @@ def publish_results(results):
     size_msg.data = area
     sign_size_pub.publish(size_msg)
     return
-
-
-# # Find if anyone is subscribed to this node
-# def has_subscribers():
-#     # False if 0 connections for both - no need to run node
-#     return (sign_detect_pub.get_num_connections()) or (sign_size_pub.get_num_connections())
-
 
 ########################################################################
 ### Main loop:
